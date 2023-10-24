@@ -2,6 +2,7 @@
 //! and push them to a HTTP endpoint.
 use crate::context::{DownloadBehavior, RequestContext};
 use crate::task_mgr::{self, TaskKind, BACKGROUND_RUNTIME};
+use crate::tenant::tasks::BackgroundLoopKind;
 use crate::tenant::{mgr, LogicalSizeCalculationCause};
 use camino::Utf8PathBuf;
 use consumption_metrics::EventType;
@@ -10,6 +11,7 @@ use reqwest::Url;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::time::Instant;
 use tracing::*;
 use utils::id::NodeId;
 
@@ -87,21 +89,11 @@ pub async fn collect_metrics(
 
     let node_id = node_id.to_string();
 
-    // reminder: ticker is ready immediatedly
-    let mut ticker = tokio::time::interval(metric_collection_interval);
-
     loop {
-        let tick_at = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            tick_at = ticker.tick() => tick_at,
-        };
+        let started_at = Instant::now();
 
         // these are point in time, with variable "now"
         let metrics = metrics::collect_all_metrics(&cached_metrics, &ctx).await;
-
-        if metrics.is_empty() {
-            continue;
-        }
 
         let metrics = Arc::new(metrics);
 
@@ -141,10 +133,19 @@ pub async fn collect_metrics(
         let (_, _) = tokio::join!(flush, upload);
 
         crate::tenant::tasks::warn_when_period_overrun(
-            tick_at.elapsed(),
+            started_at.elapsed(),
             metric_collection_interval,
-            "consumption_metrics_collect_metrics",
+            BackgroundLoopKind::ConsumptionMetricsCollectMetrics,
         );
+
+        let res = tokio::time::timeout_at(
+            started_at + metric_collection_interval,
+            task_mgr::shutdown_token().cancelled(),
+        )
+        .await;
+        if res.is_ok() {
+            return Ok(());
+        }
     }
 }
 
@@ -243,16 +244,14 @@ async fn calculate_synthetic_size_worker(
     ctx: &RequestContext,
 ) -> anyhow::Result<()> {
     info!("starting calculate_synthetic_size_worker");
+    scopeguard::defer! {
+        info!("calculate_synthetic_size_worker stopped");
+    };
 
-    // reminder: ticker is ready immediatedly
-    let mut ticker = tokio::time::interval(synthetic_size_calculation_interval);
     let cause = LogicalSizeCalculationCause::ConsumptionMetricsSyntheticSize;
 
     loop {
-        let tick_at = tokio::select! {
-            _ = task_mgr::shutdown_watcher() => return Ok(()),
-            tick_at = ticker.tick() => tick_at,
-        };
+        let started_at = Instant::now();
 
         let tenants = match mgr::list_tenants().await {
             Ok(tenants) => tenants,
@@ -268,6 +267,11 @@ async fn calculate_synthetic_size_worker(
             }
 
             if let Ok(tenant) = mgr::get_tenant(tenant_id, true).await {
+                // TODO should we use concurrent_background_tasks_rate_limit() here, like the other background tasks?
+                // We can put in some prioritization for consumption metrics.
+                // Same for the loop that fetches computed metrics.
+                // By using the same limiter, we centralize metrics collection for "start" and "finished" counters,
+                // which turns out is really handy to understand the system.
                 if let Err(e) = tenant.calculate_synthetic_size(cause, ctx).await {
                     error!("failed to calculate synthetic size for tenant {tenant_id}: {e:#}");
                 }
@@ -275,9 +279,18 @@ async fn calculate_synthetic_size_worker(
         }
 
         crate::tenant::tasks::warn_when_period_overrun(
-            tick_at.elapsed(),
+            started_at.elapsed(),
             synthetic_size_calculation_interval,
-            "consumption_metrics_synthetic_size_worker",
+            BackgroundLoopKind::ConsumptionMetricsSyntheticSizeWorker,
         );
+
+        let res = tokio::time::timeout_at(
+            started_at + synthetic_size_calculation_interval,
+            task_mgr::shutdown_token().cancelled(),
+        )
+        .await;
+        if res.is_ok() {
+            return Ok(());
+        }
     }
 }

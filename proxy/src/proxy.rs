@@ -5,7 +5,7 @@ use crate::{
     auth::{self, backend::AuthSuccess},
     cancellation::{self, CancelMap},
     compute::{self, PostgresConnection},
-    config::{ProxyConfig, TlsConfig},
+    config::{AuthenticationConfig, ProxyConfig, TlsConfig},
     console::{self, errors::WakeComputeError, messages::MetricsAuxInfo, Api},
     http::StatusCode,
     metrics::{Ids, USAGE_METRICS},
@@ -15,12 +15,11 @@ use crate::{
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use futures::TryFutureExt;
-use metrics::{
-    exponential_buckets, register_histogram, register_int_counter_vec, Histogram, IntCounterVec,
-};
+use metrics::{exponential_buckets, register_int_counter_vec, IntCounterVec};
 use once_cell::sync::Lazy;
 use pq_proto::{BeMessage as Be, FeStartupPacket, StartupMessageParams};
-use std::{error::Error, io, ops::ControlFlow, sync::Arc};
+use prometheus::{register_histogram_vec, HistogramVec};
+use std::{error::Error, io, ops::ControlFlow, sync::Arc, time::Instant};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     time,
@@ -39,33 +38,120 @@ const RETRY_WAIT_EXPONENT_BASE: f64 = std::f64::consts::SQRT_2;
 const ERR_INSECURE_CONNECTION: &str = "connection is insecure (try using `sslmode=require`)";
 const ERR_PROTO_VIOLATION: &str = "protocol violation";
 
-static NUM_CONNECTIONS_ACCEPTED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static NUM_DB_CONNECTIONS_OPENED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "proxy_opened_db_connections_total",
+        "Number of opened connections to a database.",
+        &["protocol"],
+    )
+    .unwrap()
+});
+
+pub static NUM_DB_CONNECTIONS_CLOSED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "proxy_closed_db_connections_total",
+        "Number of closed connections to a database.",
+        &["protocol"],
+    )
+    .unwrap()
+});
+
+pub static NUM_CLIENT_CONNECTION_OPENED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "proxy_opened_client_connections_total",
+        "Number of opened connections from a client.",
+        &["protocol"],
+    )
+    .unwrap()
+});
+
+pub static NUM_CLIENT_CONNECTION_CLOSED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "proxy_closed_client_connections_total",
+        "Number of closed connections from a client.",
+        &["protocol"],
+    )
+    .unwrap()
+});
+
+pub static NUM_CONNECTIONS_ACCEPTED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "proxy_accepted_connections_total",
-        "Number of TCP client connections accepted.",
+        "Number of client connections accepted.",
         &["protocol"],
     )
     .unwrap()
 });
 
-static NUM_CONNECTIONS_CLOSED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static NUM_CONNECTIONS_CLOSED_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "proxy_closed_connections_total",
-        "Number of TCP client connections closed.",
+        "Number of client connections closed.",
         &["protocol"],
     )
     .unwrap()
 });
 
-static COMPUTE_CONNECTION_LATENCY: Lazy<Histogram> = Lazy::new(|| {
-    register_histogram!(
+static COMPUTE_CONNECTION_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
         "proxy_compute_connection_latency_seconds",
         "Time it took for proxy to establish a connection to the compute endpoint",
+        // http/ws/tcp, true/false, true/false, success/failure
+        // 3 * 2 * 2 * 2 = 24 counters
+        &["protocol", "cache_miss", "pool_miss", "outcome"],
         // largest bucket = 2^16 * 0.5ms = 32s
         exponential_buckets(0.0005, 2.0, 16).unwrap(),
     )
     .unwrap()
 });
+
+pub struct LatencyTimer {
+    start: Instant,
+    protocol: &'static str,
+    cache_miss: bool,
+    pool_miss: bool,
+    outcome: &'static str,
+}
+
+impl LatencyTimer {
+    pub fn new(protocol: &'static str) -> Self {
+        Self {
+            start: Instant::now(),
+            protocol,
+            cache_miss: false,
+            // by default we don't do pooling
+            pool_miss: true,
+            // assume failed unless otherwise specified
+            outcome: "failed",
+        }
+    }
+
+    pub fn cache_miss(&mut self) {
+        self.cache_miss = true;
+    }
+
+    pub fn pool_hit(&mut self) {
+        self.pool_miss = false;
+    }
+
+    pub fn success(mut self) {
+        self.outcome = "success";
+    }
+}
+
+impl Drop for LatencyTimer {
+    fn drop(&mut self) {
+        let duration = self.start.elapsed().as_secs_f64();
+        COMPUTE_CONNECTION_LATENCY
+            .with_label_values(&[
+                self.protocol,
+                bool_to_str(self.cache_miss),
+                bool_to_str(self.pool_miss),
+                self.outcome,
+            ])
+            .observe(duration)
+    }
+}
 
 static NUM_CONNECTION_FAILURES: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
@@ -124,6 +210,8 @@ pub async fn task_main(
                         let mut socket = WithClientIp::new(socket);
                         if let Some(ip) = socket.wait_for_addr().await? {
                             tracing::Span::current().record("peer_addr", &tracing::field::display(ip));
+                        } else if config.require_client_ip {
+                            bail!("missing required client IP");
                         }
 
                         socket
@@ -218,12 +306,16 @@ pub async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
         "handling interactive connection from client"
     );
 
-    // The `closed` counter will increase when this future is destroyed.
+    let proto = mode.protocol_label();
+    NUM_CLIENT_CONNECTION_OPENED_COUNTER
+        .with_label_values(&[proto])
+        .inc();
     NUM_CONNECTIONS_ACCEPTED_COUNTER
-        .with_label_values(&[mode.protocol_label()])
+        .with_label_values(&[proto])
         .inc();
     scopeguard::defer! {
-        NUM_CONNECTIONS_CLOSED_COUNTER.with_label_values(&[mode.protocol_label()]).inc();
+        NUM_CLIENT_CONNECTION_CLOSED_COUNTER.with_label_values(&[proto]).inc();
+        NUM_CONNECTIONS_CLOSED_COUNTER.with_label_values(&[proto]).inc();
     }
 
     let tls = config.tls_config.as_ref();
@@ -258,7 +350,7 @@ pub async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
         mode.allow_self_signed_compute(config),
     );
     cancel_map
-        .with_session(|session| client.connect_to_db(session, mode.allow_cleartext()))
+        .with_session(|session| client.connect_to_db(session, mode, &config.authentication_config))
         .await
 }
 
@@ -455,23 +547,27 @@ pub async fn connect_to_compute<M: ConnectMechanism>(
     mut node_info: console::CachedNodeInfo,
     extra: &console::ConsoleReqExtra<'_>,
     creds: &auth::BackendType<'_, auth::ClientCredentials<'_>>,
+    mut latency_timer: LatencyTimer,
 ) -> Result<M::Connection, M::Error>
 where
     M::ConnectError: ShouldRetry + std::fmt::Debug,
     M::Error: From<WakeComputeError>,
 {
-    let _timer = COMPUTE_CONNECTION_LATENCY.start_timer();
-
     mechanism.update_connect_config(&mut node_info.config);
 
     // try once
     let (config, err) = match mechanism.connect_once(&node_info, CONNECT_TIMEOUT).await {
-        Ok(res) => return Ok(res),
+        Ok(res) => {
+            latency_timer.success();
+            return Ok(res);
+        }
         Err(e) => {
             error!(error = ?e, "could not connect to compute node");
             (invalidate_cache(node_info), e)
         }
     };
+
+    latency_timer.cache_miss();
 
     let mut num_retries = 1;
 
@@ -518,7 +614,10 @@ where
     info!("wake_compute success. attempting to connect");
     loop {
         match mechanism.connect_once(&node_info, CONNECT_TIMEOUT).await {
-            Ok(res) => return Ok(res),
+            Ok(res) => {
+                latency_timer.success();
+                return Ok(res);
+            }
             Err(e) => {
                 let retriable = e.should_retry(num_retries);
                 if !retriable {
@@ -734,7 +833,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<'_, S> {
     async fn connect_to_db(
         self,
         session: cancellation::Session<'_>,
-        allow_cleartext: bool,
+        mode: ClientMode,
+        config: &'static AuthenticationConfig,
     ) -> anyhow::Result<()> {
         let Self {
             mut stream,
@@ -749,8 +849,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<'_, S> {
             application_name: params.get("application_name"),
         };
 
+        let latency_timer = LatencyTimer::new(mode.protocol_label());
+
         let auth_result = match creds
-            .authenticate(&extra, &mut stream, allow_cleartext)
+            .authenticate(&extra, &mut stream, mode.allow_cleartext(), config)
             .await
         {
             Ok(auth_result) => auth_result,
@@ -772,9 +874,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<'_, S> {
         node_info.allow_self_signed_compute = allow_self_signed_compute;
 
         let aux = node_info.aux.clone();
-        let mut node = connect_to_compute(&TcpMechanism { params }, node_info, &extra, &creds)
-            .or_else(|e| stream.throw_error(e))
-            .await?;
+        let mut node = connect_to_compute(
+            &TcpMechanism { params },
+            node_info,
+            &extra,
+            &creds,
+            latency_timer,
+        )
+        .or_else(|e| stream.throw_error(e))
+        .await?;
+
+        let proto = mode.protocol_label();
+        NUM_DB_CONNECTIONS_OPENED_COUNTER
+            .with_label_values(&[proto])
+            .inc();
+        scopeguard::defer! {
+            NUM_DB_CONNECTIONS_CLOSED_COUNTER.with_label_values(&[proto]).inc();
+        }
 
         prepare_client_connection(&node, reported_auth_ok, session, &mut stream).await?;
         // Before proxy passing, forward to compute whatever data is left in the
